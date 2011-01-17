@@ -12,7 +12,7 @@
 #include <MsTimer2.h>  // http://www.arduino.cc/playground/Main/MsTimer2
 
 // version number
-const char* HSversion = "010";
+const char* HSversion = "020";
 
 // numbering from the top left around clockwise!
 byte LED6 = 3;
@@ -32,10 +32,11 @@ int i = 0;
 int j = 0;
 byte Mode = 0;  // 0=startup, 1=polar, 2=fake
 byte Chatter = 1;  // it's OK to put random crap out on serial
-byte IsLoggingVersion = 0; // does this version even have RTC and EEPROM?
-byte Logging = 0 & IsLoggingVersion;  // it's OK to log to EEPROM
+byte IsLoggingVersion = 1; // does this version even have RTC and EEPROM?
+byte Logging = 1 & IsLoggingVersion;  // it's OK to log to EEPROM
     // & IsLoggingVersion: so that you don't forget to turn off this variable 
-    // too: it's impossible to be logging is it's not a logging version!
+    // too: it's impossible to be logging if it's not a logging version!
+boolean TroubleReadingHeader = false;
 
 // values modified inside the interrupt function
 // must be declared as volatile
@@ -99,9 +100,7 @@ void setup() {
   digitalWrite(DIP2pin, HIGH);  // set internal pullup resistor on
   
   Wire.begin();
-  
-  if (Logging) ReadParseHeader(); // set EEPROM page counter to first unwritten page
-    
+      
   // we do this later now, to avoid spurious false-positives  
   //attachInterrupt(0, PolarInterrupt, RISING);
 
@@ -134,14 +133,15 @@ void setup() {
   //CLKPR = B00000011; 
   
   sleep_enable();          // enables the sleep bit in the mcucr register
-                           // so sleep is possible. just a safety pin 
-  InitTime = millis();
-
-  //MsTimer2::set(5000, StartupCheck);  // after five seconds, see if we've
-  //MsTimer2::start();  // recorded any blinks, if not go into fake mode
-
-  Startup_Blink();
+                           // so sleep is possible. just a safety pin
+                           
   DIP_mode();  // check before we sleep if we're in fake mode!
+  InitTime = millis();
+  Startup_Blink();
+
+  // do this last, give the EEPROM time to start itself, esp. in cases
+  // of brownout
+  if (Logging) ReadParseHeader(); // set EEPROM page counter to first unwritten page
 }
 
 
@@ -164,10 +164,9 @@ because of the MsTimer2 library.  So anything in loop() is
 hit once/ms, which is why everything is behind if statements,
 so that the main loop can put things back to sleep quickly.
 
-If no interrupts are received from the polar chip in the first
-five seconds, the device enters "fake mode", where it will blink
-the LEDs at 75 BMP, until heart-beats ARE detected.
-
+If the DIPs position is "fake mode", then timer2 is used to 
+wake up the device at 75 BPM and blink the LEDs, while
+any interrupts from the polar are simply ignored.
 /* **************************************************** */
 void loop() {
   
@@ -180,12 +179,15 @@ void loop() {
     PolarIRQ = false;
     PolarCalcs();
   }
-  
+
+  // check DIPs always, because otherwise you can end up not 
+  // trigger fakemode when they are not wearing a chest strap
+  // and the flip the switches after they power up...  
+  DIP_mode();
   
   if (setblink)
   {
     setblink = 0;
-    DIP_mode();
     
     if (DIPs == 0)
       fancy2_blink();
@@ -193,15 +195,15 @@ void loop() {
       activity_blink();
     else if (DIPs == 2)
       blink_leds();
-    else // DIPs == 3, or some kind of strange setting?!?
+    else // DIPs == 3, also catch all
       fake_blink();
     
     
     if (Mode != 2)
     {  // only log if it's REAL data, duh!
       BlinkCount++;
-      // log only if requested, and only until we've used up all 256 pages
-      if (Logging && (eecounter < 256) && IsLoggingVersion ) CollectData();
+      // log only if requested, and only until we've used up all 512 pages
+      if (Logging && (eecounter < 512)) CollectData();
     }
 
   }
@@ -241,9 +243,10 @@ void HandleSerial()
       Serial.println(eecounter); // no if (Chatter), need this info!
     else if (input == 'P')   // RESET page number to 1 (note: this will overwrite old data!)
       ResetEECounter();
+    else if (input == 't')   // test the EEPROM
+      TestEEPROM();
   }
 }
-
 
 
 void SetupFakeMode()
@@ -261,7 +264,7 @@ void SetupFakeMode()
 void EndFakeMode()
 {
   MsTimer2::stop();
-  if (Logging) power_twi_enable(); // turn on TWI if logging in real mode
+  //if (Logging) power_twi_enable(); // turn on TWI if logging in real mode
   if (Chatter) Serial.println("Stopping Fake Mode!");
   ModeChangeFlash();
   InitTime = millis();
@@ -284,10 +287,16 @@ void ResetEECounter()
   WriteHeaderPage();
 }
 
+
 void ToggleLogging()
 {
   Logging = 1-Logging;
+
   if (Logging)
+    power_twi_enable();
+  else
+    power_twi_disable();  // save power if we don't need it
+
   if (Chatter)
   {
     Serial.print("Logging: ");
@@ -298,10 +307,7 @@ void ToggleLogging()
 void ToggleChatter()
 {
   Chatter = 1-Chatter;
-  if (Logging)
-    power_twi_enable();   // leave this ENABLED, it talks to EEPROM/RTC
-  else
-    power_twi_disable();
+  
   //{
     Serial.print("Chatter: ");
     Serial.println(Chatter, DEC);
@@ -352,7 +358,9 @@ void ReadParseHeader()
  if (ToSend[0] == 201)
  {  // then we've got a valid header
    eecounter = ToSend[7];  // page count
-   ToSendIndex = ToSend[8]; // byte count inside page
+   ToSendIndex = 0; //ToSend[8]; // byte count inside page
+     // always make it zero for now, we must regenerate the page from
+     // scratch since we're not doing partial logging of the page...
    // maybe do something with that date, too?
    if (Chatter)
    {
@@ -360,6 +368,56 @@ void ReadParseHeader()
      Serial.println(eecounter);
    }
  }
+ else
+ { // well now, we've got some kind of error or strange thing going on
+   // I have experienced cases where the HS will repeatidly overwrite 
+   // the start of the EEPROM when the battery voltage gets low
+   // I think this is because the ATMEGA resets, and when we get to
+   // here, the EEPROM header pages fails to read correctly (perhaps
+   // because the EEPROM too is suffering from low voltage problem)
+   // giving us a chance: give the battery TIME to get back to a reasonable
+   // voltage.  I know it can, since the device will operate for at least
+   // 4 hours past the first brown-out according to my data
+   // the trick is to SLEEP, giving the battery time to recover
+   // so: disable polar interrupt, trigger timer interrupt for a few seconds
+   // from now, and sleep.  When it wakes, read the page, then resume normal
+   // operation.
+   if (TroubleReadingHeader == false)  // check if first time through this trouble
+   {
+      TroubleReadingHeader = true;
+      detachInterrupt(0);
+      Logging = false;  // make sure we don't overwrite page one or the header
+      MsTimer2::set(2000, DelayedHeaderRead);
+      MsTimer2::start();
+      sleep_mode();  // knock ourselves out for 2 seconds
+   }
+   else
+   {  // we're failed to read a proper header TWICE now
+      // after much thought, I've decided that the best bet here is to 
+      // simply DIE.  Any other behavior risks overwriting good data.
+      // BUT, it should be noted that the case of corrupt header data is
+      // probably as likely as the case of brown-out failure-to-read. It's
+      // just that both cases have the SAME best course of action: get the
+      // user to DO something, like replace the battery or grab the data
+      // and reset the header page.  So, blink "error blink" and sleep
+      // permanently at lowest power mode.
+      // another good reason to knock ourselves out in this case is
+      // to preserve power for the RTC, so that if they notice
+      // a few hours from now, the time will still be correct!
+     Error_Blink();
+     detachInterrupt(0);
+     MsTimer2::stop();
+     set_sleep_mode(SLEEP_MODE_PWR_DOWN);  // everything off
+     sleep_mode();  // we will never wake from this
+   }
+ }
+   
+}
+
+void DelayedHeaderRead()
+{  // try again, see if we get lucky
+  MsTimer2::stop();
+  ReadParseHeader();
 }
 
 void ReadPrintDataLine()
@@ -373,11 +431,10 @@ void ReadPrintDataLine()
   readcounter++;
 }
 
-/*
+
 void TestEEPROM()
-{
-  //for (i = 0; i<4; i++)
-  //  i2c_eeprom_read_buffer(EEPROM_I2C_ADDRESS, eecounter*128+i*32, &ToSend[i*32], 32);
+{ // simple function to write some data to the eeprom and read it back,
+  // thus confirming that the eeprom is working...
   
   for (i = 0; i<32; i++)
   {
@@ -386,18 +443,18 @@ void TestEEPROM()
     if (j > 255) j = 0;
   }
   
-  i2c_eeprom_write_page(EEPROM_I2C_ADDRESS, 0,ToSend, 32);
+  // write into the header page, but above where the useful data is
+  // usually stored.  Note that the header page is the most likely
+  // page to fail, since we write it *way* more than any other page.
+  i2c_eeprom_write_page(EEPROM_I2C_ADDRESS, 32,ToSend, 32);
   delay(4);
 
   for (i = 0; i<32; i++)
     ToSend[i] = 0;
   
-  i2c_eeprom_read_buffer(EEPROM_I2C_ADDRESS, 2, ToSend, 32);
-  delay(1000);
-  Serial.println("");
+  i2c_eeprom_read_buffer(EEPROM_I2C_ADDRESS, 32, ToSend, 32);
+  PrintBuffer();
 }
-*/
-
 
 void DIP_mode()
 {
@@ -420,14 +477,12 @@ void DIP_mode()
   }
 }
 
-
-
 void CollectData()
 {
 
 /*
 Some notes on my testing of Wire.h library and EEPROM code:
- - addresses are to bytes: the 512kbit EEPRMOM has 32k bytes, which 
+ - addresses are to bytes: the 512kbit EEPRMOM has 64k bytes, which 
       is perfectly addressed by unsigned 16-bit int
  - EEPROM itself is structed into 128-byte PAGES
     - if you try to WRITE past a page end, the write loops and
@@ -440,7 +495,7 @@ Some notes on my testing of Wire.h library and EEPROM code:
  - Wire.h is terribly written.  It actually uses *5* buffers, each of size
      BUFFER_SIZE = 32.  So you can only send 32 byte messages using Wire.h
      Further more, there is some kind of bug, write actually fucks up the 
-     31st & 32nd byte, so the actual usable buffer size is only 30 bytes
+     31st & 32nd byte, so the actual usable write buffer size is only 30 bytes
  - combining the previous facts, you can immediatly see a problem
     - addressing data in 30-byte chunks, you'd have to be super paranoid
        about page boundaries, and likely end up not using some of the memory
@@ -450,46 +505,38 @@ Some notes on my testing of Wire.h library and EEPROM code:
     limited write cycles 5x as fast as actually writing out the 128-byte 
     pages in one go, but it will still be way better than managing page 
     boundaries, and I'll rewrite Wire.h at some later point to fix this issue.
-    
+
 Heart Spark EEPROM Data Format
 ------------------------------
 
 Each 128-byte PAGE has it's own internal map and structure, according to 
 it's type:
 
-Byte 0: Data type
-  100: HEADER page, at the beginning of the EEPROM
+Byte 0: page type
+  101: BPM page, 0-255 BPM (a byte of data) for each heart beat
+  201: HEADER page, at the beginning of the EEPROM
        bytes 7 & 8 specify the location of the next blank page.
-  101: 8-bit beats/minute data (0-255 BPM) for each beat
-  102: 8-bit average heart rate, 1 byte/minute
-	each byte is literally the average beats/min, BPM (0-255)
-  103: 8-bit heartbeat timing data, 
-	each 8-bit reading is >>3 from ms reading, so to recover
-	milliSecondsSinceLastBeat = data << 3;
-	0-2047ms reading, but with only 8ms of precision 
+at some future point, there will be more types, like for instance it
+would be cool to have a type that stored the average BPM for 1 minute
+intervals in each byte, thus giving the pendant a logging time
+of weeks instead of hours.
 
 Bytes 1-6: Date/Time, the time of the FIRST data point in this set
  year month dayOfMonth hour minute second
 
-Bytes 7-127: data, as specified by the type.  If the data is ZERO, skip
-	to the next page, the rest of the page will be blank because the
-	user changed the mode
+Bytes 7-127: data, as specified by the type.  
 
 HEADER page: for storing pointer to the next location to be written
-Byte 0: Header type  (201 and up)
-Byte 1: page number
-Byte 2: byte number inside page (0 = unnecessary)
-Byte 3-7: date of last update to this header (year month ...)
-
-NOTE: location stored is YET TO BE WRITTEN
-
+Byte 7: eecounter, the next-to-be-written data page
+Byte 8: tosendindex, the location inside that page to be written next
+  (note that tosendindex is currently useless since we do not write
+   partial pages)
 
 */
   
   if (ToSendIndex == 0)
-  { 
-    WriteHeaderPage();
-
+  {
+    getDate8536();
     // structure the new data page:
     ToSend[0] = 101;  // for now, this is the only implimented data type
     ToSend[1] = year;
@@ -502,21 +549,6 @@ NOTE: location stored is YET TO BE WRITTEN
     for (i = 7; i<128; i++)
       ToSend[i] = 0;  // clear the buffer of old data
     //if (Chatter) Serial.println("Starting New Page");
-    
-    // also, wipe out the data in this new slot, so that
-    // the receiver program can tell when it reaches the end 
-    // of the current data collection
-
-    if (eecounter != 1)  // no point nuking first page
-    {  // in fact, that hurts us when they try to grab the data
-      for (i = 0; i<4; i++)
-      {
-        i2c_eeprom_write_page(EEPROM_I2C_ADDRESS, eecounter*128+i*30,&ToSend[30], 30);
-        delay(4); // delay 4ms, because the EEPROM will ignore everything
-            // for that long, basically until it's done writing that page...
-      }
-      i2c_eeprom_write_page(EEPROM_I2C_ADDRESS, eecounter*128+120,&ToSend[120], 8);
-    }
   }
   // append the new heart rate data, increment pointer
   ToSend[ToSendIndex++] = HeartRate;
@@ -531,32 +563,17 @@ NOTE: location stored is YET TO BE WRITTEN
           // for that long, basically until it's done writing that page...
     }
     i2c_eeprom_write_page(EEPROM_I2C_ADDRESS, eecounter*128+120,&ToSend[120], 8);   
+    delay(4);
     ToSendIndex = 0; 
     eecounter++;  // move to next page in EEPROM
+    WriteHeaderPage();  // we used to do this in ToSendIndex == 0 but it's better here
+        // because there was always the chance that something would happen
+        // between now and the next loop iteration... and that could result
+        // in loosing this page of data!
     if (Chatter) Serial.print("Saved Data to EEPROM: ");
     if (Chatter) PrintBuffer();
     EEPROM_Blink();
-  }  
-
-
-/*  // code from before, other data packers...
-        // 8 bit packing
-        //ToSend[ToSendIndex++] = (PolarTime >> 3) & 0xFF;  // allows 0-2048 ms range in 8 bits
-        // main downside is only 8ms resolution :-(    
-        
-        // 12 bit data, pack 2 data points into 3 bytes
-        // should get about 8 hours of logging on 512kb
-        // for this PolarLogNum should be 18
-        ToSend[j++] = PolarTime[i] & 0xFF;
-        ToSend[j++] = ( ( (PolarTime[i] >> 8) << 4) & 0xF0) & ( (PolarTime[i+1] >> 8) & 0x0F);
-        ToSend[j++] = PolarTime[i+1] & 0xFF;
-        
-        // 16 bit data -- easy to use
-        // should get about 5 hours of logging on 512kb
-        // for this PolarLogNum should be 12
-        //ToSend[j + i*2] = PolarTime[i] >> 8;
-        //ToSend[j + i*2+1] = PolarTime[i] & 0xFF;
-*/
+  }
 }
 
 void WriteHeaderPage()
@@ -564,7 +581,7 @@ void WriteHeaderPage()
     //getDateDs1307();
     getDate8536();
     
-    // structure the index page
+    // structure the header page
     ToSend[0] = 201;
     ToSend[1] = year;
     ToSend[2] = month;
@@ -622,6 +639,21 @@ void EEPROM_Blink()
   digitalWrite(LED2, LOW);
 }
 
+void Error_Blink()
+{  // blink this when we encounter an irrecoverable error
+   // blink the bottom LED three times: low power, very distinctive
+  digitalWrite(LED3, HIGH);
+  delay(150);
+  digitalWrite(LED3, LOW);
+  delay(150);
+  digitalWrite(LED3, HIGH);
+  delay(150);
+  digitalWrite(LED3, LOW);
+  delay(150);
+  digitalWrite(LED3, HIGH);
+  delay(150);
+  digitalWrite(LED3, LOW);
+}
 
 void Startup_Blink()
 {
@@ -636,10 +668,9 @@ void Startup_Blink()
   digitalWrite(LED3, LOW);
 }
 
-
 void PolarInterrupt(void)
 {
-  PolarIRQ = true;
+  PolarIRQ = true;  // set flag and let main loop handle it
 }
 
 void PolarCalcs(void)
@@ -706,7 +737,7 @@ void PolarCalcs(void)
         Serial.print(HeartRate, DEC);
         Serial.print(" BPM; number");
         Serial.print(BlinkCount);
-        Serial.println(" of 10");
+        //Serial.println(" of 10");
       }
     }
     else
