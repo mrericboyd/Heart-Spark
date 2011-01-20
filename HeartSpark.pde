@@ -6,6 +6,7 @@
 #define EEPROM_I2C_ADDRESS  B1010000
 #define PCF8563_I2C_ADDRESS B1010001
 
+
 #include <avr/sleep.h>
 #include <avr/power.h>
 #include <Wire.h>
@@ -37,6 +38,7 @@ byte Logging = 1 & IsLoggingVersion;  // it's OK to log to EEPROM
     // & IsLoggingVersion: so that you don't forget to turn off this variable 
     // too: it's impossible to be logging if it's not a logging version!
 boolean TroubleReadingHeader = false;
+boolean BlinkOverride = false;
 
 // values modified inside the interrupt function
 // must be declared as volatile
@@ -72,7 +74,7 @@ byte ToSendIndex = 0;
 
 void setup() {
   Serial.begin(57600);          //  setup serial
-  if (Chatter) Serial.println("setup");
+  if (Chatter) Serial.println("Heart Spark!");
 
   // there are two pins on the ATMEGA that are shorted
   // to other traces, because of routing convenience
@@ -135,13 +137,17 @@ void setup() {
   sleep_enable();          // enables the sleep bit in the mcucr register
                            // so sleep is possible. just a safety pin
                            
-  DIP_mode();  // check before we sleep if we're in fake mode!
   InitTime = millis();
   Startup_Blink();
 
   // do this last, give the EEPROM time to start itself, esp. in cases
   // of brownout
   if (Logging) ReadParseHeader(); // set EEPROM page counter to first unwritten page
+
+  // this must come after ReadParseHeader, otherwise we might 
+  // potentially never read the header page, if they start in fake
+  // and switch out of it
+  DIP_mode();  // check before we sleep if we're in fake mode!
 }
 
 
@@ -189,15 +195,14 @@ void loop() {
   {
     setblink = 0;
     
-    if (DIPs == 0)
-      fancy2_blink();
-    else if (DIPs == 1)
-      activity_blink();
-    else if (DIPs == 2)
-      blink_leds();
-    else // DIPs == 3, also catch all
-      fake_blink();
-    
+    if (BlinkOverride) BlinkError();
+    else
+    {
+      if (DIPs == 0) fancy2_blink();
+      else if (DIPs == 1) activity_blink();
+      else if (DIPs == 2) blink_leds();
+      else fake_blink();  // DIPs == 3, catch all
+    }    
     
     if (Mode != 2)
     {  // only log if it's REAL data, duh!
@@ -234,7 +239,7 @@ void HandleSerial()
     else if (input == 'r')   // reset read counter to first data page
       readcounter = 1;
     else if (input == 'd')   // read RTC and print
-      PrintDate();
+      PrintDate(false);
     else if (input == 'D')   // set date based on forthcoming date string
       GetSetDate();
     else if (input == 'l')   // toggle logging
@@ -245,6 +250,8 @@ void HandleSerial()
       ResetEECounter();
     else if (input == 't')   // test the EEPROM
       TestEEPROM();
+    else if (input == 'h')   // transmit header info
+      PrintHeader();
   }
 }
 
@@ -288,6 +295,21 @@ void ResetEECounter()
 }
 
 
+void PrintHeader()
+{
+  byte headerdata[10];
+   // do it regardless of status of Logging or IsLoggingVersion
+   //  -- this is a debugging tool, so spit out nonsense if they want us to
+   i2c_eeprom_read_buffer(EEPROM_I2C_ADDRESS, 0, &headerdata[0], 10);
+   for (i = 0; i<10; i++)
+   {
+     Serial.print(headerdata[i], DEC);
+     Serial.print(",");
+   }
+   Serial.println("");
+}
+
+
 void ToggleLogging()
 {
   Logging = 1-Logging;
@@ -314,47 +336,49 @@ void ToggleChatter()
   //}
 }
 
-void PrintDate()
+void PrintDate(boolean english)
 {  // print in csv format for easy parsing
    //getDateDs1307();   
    getDate8536();
-   /*
-   Serial.print(hour, DEC);
-   Serial.print(":");
-   Serial.print(minute, DEC);
-   Serial.print(":");
-   Serial.print(second, DEC);
-   Serial.print(" ");
-   Serial.print(year+2000, DEC);
-   Serial.print("-");
-   Serial.print(month, DEC);
-   Serial.print("-");
-   Serial.print(dayOfMonth, DEC);
-   Serial.println("");
-   */
    
-   Serial.print("001,"); // format version
-       // actually this is here just so that the date will be in the 
-       // same set of buffers ([1]->[6]) as it always is
-   Serial.print(year, DEC);
-   Serial.print(",");
-   Serial.print(month, DEC);
-   Serial.print(",");
-   Serial.print(dayOfMonth, DEC);
-   Serial.print(",");
-   Serial.print(hour, DEC);
-   Serial.print(",");
-   Serial.print(minute, DEC);
-   Serial.print(",");
-   Serial.print(second, DEC);
-   Serial.println(",");
-   
+   if (english)
+   {
+     Serial.print(year+2000, DEC);
+     Serial.print("/");
+     Serial.print(month, DEC);
+     Serial.print("/");
+     Serial.print(dayOfMonth, DEC);
+     Serial.print(" ");
+     Serial.print(hour, DEC);
+     Serial.print(":");
+     Serial.print(minute, DEC);
+     Serial.print(":");
+     Serial.println(second, DEC);
+   }
+   else
+   {
+     Serial.print("001,"); // format version
+         // actually this is here just so that the date will be in the 
+         // same set of buffers ([1]->[6]) as it always is
+     Serial.print(year, DEC);
+     Serial.print(",");
+     Serial.print(month, DEC);
+     Serial.print(",");
+     Serial.print(dayOfMonth, DEC);
+     Serial.print(",");
+     Serial.print(hour, DEC);
+     Serial.print(",");
+     Serial.print(minute, DEC);
+     Serial.print(",");
+     Serial.print(second, DEC);
+     Serial.println(",");
+   } 
 }
 
 void ReadParseHeader()
 {
   // grab the header, and set the eecounter to the first empty position
- i2c_eeprom_read_buffer(EEPROM_I2C_ADDRESS, 0, &ToSend[0], 32);
+ i2c_eeprom_read_buffer(EEPROM_I2C_ADDRESS, 0, &ToSend[0], 10);
  if (ToSend[0] == 201)
  {  // then we've got a valid header
    eecounter = ToSend[7];  // page count
@@ -364,9 +388,10 @@ void ReadParseHeader()
    // maybe do something with that date, too?
    if (Chatter)
    {
-     Serial.print("Starting logging at EEPROM page number: ");
+     Serial.print("EEPROM write page: ");
      Serial.println(eecounter);
    }
+   PrintDate(true);
  }
  else
  { // well now, we've got some kind of error or strange thing going on
@@ -375,49 +400,17 @@ void ReadParseHeader()
    // I think this is because the ATMEGA resets, and when we get to
    // here, the EEPROM header pages fails to read correctly (perhaps
    // because the EEPROM too is suffering from low voltage problem)
-   // giving us a chance: give the battery TIME to get back to a reasonable
-   // voltage.  I know it can, since the device will operate for at least
-   // 4 hours past the first brown-out according to my data
-   // the trick is to SLEEP, giving the battery time to recover
-   // so: disable polar interrupt, trigger timer interrupt for a few seconds
-   // from now, and sleep.  When it wakes, read the page, then resume normal
-   // operation.
-   if (TroubleReadingHeader == false)  // check if first time through this trouble
-   {
-      TroubleReadingHeader = true;
-      detachInterrupt(0);
-      Logging = false;  // make sure we don't overwrite page one or the header
-      MsTimer2::set(2000, DelayedHeaderRead);
-      MsTimer2::start();
-      sleep_mode();  // knock ourselves out for 2 seconds
-   }
-   else
-   {  // we're failed to read a proper header TWICE now
-      // after much thought, I've decided that the best bet here is to 
-      // simply DIE.  Any other behavior risks overwriting good data.
-      // BUT, it should be noted that the case of corrupt header data is
-      // probably as likely as the case of brown-out failure-to-read. It's
-      // just that both cases have the SAME best course of action: get the
-      // user to DO something, like replace the battery or grab the data
-      // and reset the header page.  So, blink "error blink" and sleep
-      // permanently at lowest power mode.
-      // another good reason to knock ourselves out in this case is
-      // to preserve power for the RTC, so that if they notice
-      // a few hours from now, the time will still be correct!
-     Error_Blink();
-     detachInterrupt(0);
-     MsTimer2::stop();
-     set_sleep_mode(SLEEP_MODE_PWR_DOWN);  // everything off
-     sleep_mode();  // we will never wake from this
-   }
+   // I tried a scheme to wait and read again, but that doesn't seem
+   // to actually work, so solution: turn off logging, and make
+   // it link in strange ways to alert user that logging is disabled
+   Serial.println("Header Bad: ");
+   PrintHeader();
+   Error_Blink();
+   BlinkOverride = true; // make it blink funny in all modes
+   Logging = 0;  // turn logging off, since we don't know how to log
+       // without potentially overwritting good data.
  }
    
-}
-
-void DelayedHeaderRead()
-{  // try again, see if we get lucky
-  MsTimer2::stop();
-  ReadParseHeader();
 }
 
 void ReadPrintDataLine()
@@ -461,11 +454,13 @@ void DIP_mode()
   // check DIPs, then switch mode
   DIPs = digitalRead(DIP1pin);
   DIPs += 2 * digitalRead(DIP2pin);
+  /*
   if (Chatter)
   {
     Serial.print("DIPs: ");
     Serial.println(DIPs, DEC);
   }
+  */
   
   if ( (DIPs == 3) && (Mode != 2))
   {  // then the user just switched to fake mode 
@@ -570,7 +565,7 @@ Byte 8: tosendindex, the location inside that page to be written next
         // because there was always the chance that something would happen
         // between now and the next loop iteration... and that could result
         // in loosing this page of data!
-    if (Chatter) Serial.print("Saved Data to EEPROM: ");
+    if (Chatter) Serial.print("EEPROM Write: ");
     if (Chatter) PrintBuffer();
     EEPROM_Blink();
   }
@@ -628,6 +623,24 @@ void ModeChangeFlash()
 
 void EEPROM_Blink()
 {
+   // blink the bottom LED three times: low power, very distinctive
+   // point down is like saving: I'm bend over my desk writing
+  digitalWrite(LED3, HIGH);
+  delay(150);
+  digitalWrite(LED3, LOW);
+  delay(150);
+  digitalWrite(LED3, HIGH);
+  delay(150);
+  digitalWrite(LED3, LOW);
+  delay(150);
+  digitalWrite(LED3, HIGH);
+  delay(150);
+  digitalWrite(LED3, LOW);
+}
+
+void Error_Blink()
+{  // blink this when we encounter an irrecoverable error
+   // 2-4-2: it's like shaking head NO
   digitalWrite(LED2, HIGH);
   delay(150);
   digitalWrite(LED2, LOW);
@@ -639,24 +652,8 @@ void EEPROM_Blink()
   digitalWrite(LED2, LOW);
 }
 
-void Error_Blink()
-{  // blink this when we encounter an irrecoverable error
-   // blink the bottom LED three times: low power, very distinctive
-  digitalWrite(LED3, HIGH);
-  delay(150);
-  digitalWrite(LED3, LOW);
-  delay(150);
-  digitalWrite(LED3, HIGH);
-  delay(150);
-  digitalWrite(LED3, LOW);
-  delay(150);
-  digitalWrite(LED3, HIGH);
-  delay(150);
-  digitalWrite(LED3, LOW);
-}
-
 void Startup_Blink()
-{
+{  // blink 3-6-3: it's like nodding YES
   digitalWrite(LED3, HIGH);
   delay(150);
   digitalWrite(LED3, LOW);
@@ -699,7 +696,7 @@ void PolarCalcs(void)
 
       if (Chatter)
       {
-         Serial.print("Polar Interrupt: ");
+         Serial.print("beat: ");
          Serial.print(HeartRate);
          Serial.print(" BPM, ");
          Serial.print(PolarTime);
@@ -711,44 +708,18 @@ void PolarCalcs(void)
     else
     {
       NoSecondSkip = 1;
-      if (Chatter) Serial.println("Polar Interrupt: false positive");
+      if (Chatter) Serial.println("beat: false positive");
     }
   }
   else if (Mode == 2)
   {
-    if (Chatter) Serial.print("Polar Interrupt during Fake Mode: ");
+    if (Chatter) Serial.print("beat during Fake Mode: ");
     time = millis();
     NewPolar = time - LastTime;
     LastTime = time;
     HeartRate = 60000/NewPolar;
-
-    // if it's a "reasonable" heart beat then count it 
-    //    towards the end of Fake Mode (10 real beats required)
-    // NOTE: this check is necessary because if the chest strap is 
-    // close but not on you (like, in your backpack), it will send
-    // out a considerable number of pulses - about 3/minute, actually
-    // so any non-filtering counter will be quickly overwhelmed...
-    if ((NewPolar < 1200) && (HeartRate != 81))
-    {  
-      BlinkCount++; 
-      if (Chatter) 
-      {
-        Serial.print("Counted: ");
-        Serial.print(HeartRate, DEC);
-        Serial.print(" BPM; number");
-        Serial.print(BlinkCount);
-        //Serial.println(" of 10");
-      }
-    }
-    else
-    {
-      if (Chatter)
-      {
-        Serial.print("not counted: ");
-        Serial.print(HeartRate);
-        Serial.println(" BPM");
-      }
-    }
+    Serial.print(HeartRate);
+    Serial.println(" BPM");
   }
 }
 
@@ -762,6 +733,17 @@ void blink_leds(void)
   delay(120);
   ChangeLEDs(HIGH);
   delay(10);
+  ChangeLEDs(LOW);
+}
+
+
+void BlinkError(void)
+{ 
+  // single blink them all... this saves power
+  // and it's very distinctivly "wrong", which will hopefully alert the user
+  // to the problem.
+  ChangeLEDs(HIGH);
+  delay(20);
   ChangeLEDs(LOW);
 }
 
@@ -1138,7 +1120,7 @@ void GetSetDate()
   while (Serial.available() != 0) {Serial.read();}
   //setDateDs1307();
   setDate8536();
-  Serial.println("  FINISHED setting date");
+  Serial.println("date set");
 }
 
 
